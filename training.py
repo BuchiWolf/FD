@@ -648,6 +648,51 @@ def train_model(
         meta["prototype_summary"] = proto_summary
     return model, meta
 
+def finetune_model_with_buffer_optimized(
+    model, memory_buffer, new_cluster_data, device, vocab_size, weights,
+    lr=5e-6, epochs=2, anchor_weight=150.0
+):
+    """ 强化版经验回放微调：施加超强 Anchor Loss 锁定主干语义，只允许原型层轻微适配新行为 """
+    if new_cluster_data is None or len(new_cluster_data["num"]) == 0:
+        return model, memory_buffer
+        
+    # 合并缓冲区数据
+    merged_data = {}
+    for k in memory_buffer.keys():
+        merged_data[k] = torch.cat([memory_buffer[k], new_cluster_data[k]], dim=0)
+        
+    loader = torch.utils.data.DataLoader(BufferDataset(merged_data), batch_size=128, shuffle=True)
+    
+    # 极小学习率，防止主干重构网络的参数发生剧烈漂移
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    old_protos_snapshot = model.proto_layer.prototypes.detach().clone()
+    k_old = old_protos_snapshot.size(0)
+    
+    model.train()
+    for ep in range(epochs):
+        for batch in loader:
+            num, seq = batch["num"].to(device), batch["seq"].to(device)
+            ctx_dyn, ctx_stat = batch["ctx_dynamic"].to(device), batch["ctx_static"].to(device)
+            
+            optimizer.zero_grad()
+            _, r_num, r_ctx_dyn, r_seq, _, _ = model(num, ctx_dyn, ctx_stat, seq)
+            
+            # 计算重构误差防火墙
+            loss_num = torch.nn.MSELoss()(r_num, num)
+            loss_ctx = torch.nn.MSELoss()(r_ctx_dyn, ctx_dyn)
+            loss_seq = torch.nn.CrossEntropyLoss(ignore_index=0)(r_seq.view(-1, vocab_size), seq.view(-1))
+            loss_recon = weights["num"] * loss_num + weights["ctx"] * loss_ctx + weights["seq"] * loss_seq
+            
+            # 施加锚点损失：强行禁止旧原型质心发生几何位移
+            loss_anchor = torch.nn.functional.mse_loss(model.proto_layer.prototypes[:k_old], old_protos_snapshot)
+            
+            total_loss = loss_recon + anchor_weight * loss_anchor
+            total_loss.backward()
+            optimizer.step()
+            
+    return model, memory_buffer
+
+
 class BufferDataset(Dataset):
     def __init__(self, data_dict):
         self.num = data_dict["num"]

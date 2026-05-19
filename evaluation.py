@@ -29,6 +29,136 @@ from training import CERTDataset
 
 logger = logging.getLogger(__name__)
 
+def evaluate_and_extract_z_optimized(
+    model, test_pkl, batch_size=128, device="cuda", weights=None, vocab_size=8,
+    low_score_anomaly_dbscan_eps=0.12, low_score_anomaly_dbscan_min_samples=30,
+    tta_ema_alpha=0.02, tta_radius_tolerance=1.05, proto_penalty_weight=20.0,
+    enable_tta=True, baseline_f1_threshold=1.5
+):
+    # 基础初始化与数据加载逻辑
+    from training import CERTDataset
+    dataset = CERTDataset(test_pkl)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    
+    if weights is None: weights = {"num": 1.0, "ctx": 1.0, "seq": 0.1}
+    model.eval()
+    
+    z_list, err_list, labels_list, user_dates = [], [], [], []
+    raw_num_list, raw_ctx_dyn_list, raw_ctx_stat_list, raw_seq_list = [], [], [], []
+    
+    with torch.no_grad():
+        for batch in loader:
+            num, seq = batch["num"].to(device), batch["seq"].to(device)
+            ctx_dyn, ctx_stat = batch["ctx_dynamic"].to(device), batch["ctx_static"].to(device)
+            
+            z, r_num, r_ctx_dyn, r_seq, min_dist, _ = model(num, ctx_dyn, ctx_stat, seq)
+            
+            # 计算重构误差
+            e_num = torch.mean((r_num - num) ** 2, dim=1)
+            e_ctx = torch.mean((r_ctx_dyn - ctx_dyn) ** 2, dim=1)
+            ce = nn.CrossEntropyLoss(ignore_index=0, reduction="none")(r_seq.view(-1, vocab_size), seq.view(-1))
+            e_seq = ce.view(num.size(0), -1).mean(dim=1)
+            
+            recon_err = weights["num"] * e_num + weights["ctx"] * e_ctx + weights["seq"] * e_seq
+            
+            z_list.append(z.cpu().numpy())
+            err_list.append(recon_err.cpu().numpy())
+            labels_list.extend(batch["label"].numpy())
+            user_dates.extend(batch["user_date"])
+            
+            raw_num_list.append(num.cpu())
+            raw_ctx_dyn_list.append(ctx_dyn.cpu())
+            raw_ctx_stat_list.append(ctx_stat.cpu())
+            raw_seq_list.append(seq.cpu())
+            
+    Z = np.concatenate(z_list, axis=0)
+    score_recon = np.concatenate(err_list, axis=0)
+    labels = np.array(labels_list)
+    
+    # 动态为模型初始化全局联合半径
+    if not hasattr(model, 'unified_radii') or model.unified_radii is None:
+        model.unified_radii = torch.ones(model.proto_layer.prototypes.size(0), device=device) * 0.35
+
+    final_anomaly_scores = score_recon.copy()
+    new_cluster_data = None
+    
+    if enable_tta:
+        Z_tensor = torch.tensor(Z, device=device)
+        protos_norm = torch.nn.functional.normalize(model.proto_layer.prototypes.data, p=2, dim=-1)
+        dists_matrix = torch.cdist(Z_tensor, protos_norm, p=2)
+        min_dists, hit_ids = torch.min(dists_matrix, dim=1)
+        
+        # 边界协同判定：只有在未超过高风险重构防火墙时，才考虑将其视为潜在的概念漂移
+        radii_thresh = model.unified_radii[hit_ids].cpu().numpy() * tta_radius_tolerance
+        is_drift_candidate = (min_dists.cpu().numpy() > radii_thresh) & (score_recon < baseline_f1_threshold * 1.3)
+        
+        # 顺应模式下的现有原型动量更新
+        is_inlier = ~is_drift_candidate
+        for k in range(protos_norm.size(0)):
+            mask = (hit_ids.cpu().numpy() == k) & is_inlier
+            if np.any(mask):
+                k_z = Z_tensor[torch.from_numpy(mask).to(device)]
+                model.proto_layer.prototypes.data[k] = (1 - tta_ema_alpha) * model.proto_layer.prototypes.data[k] + tta_ema_alpha * torch.mean(k_z, dim=0)
+
+        # 执行联合表征空间 DBSCAN 模式发掘
+        drift_indices = np.where(is_drift_candidate)[0]
+        if len(drift_indices) >= low_score_anomaly_dbscan_min_samples:
+            dbscan = DBSCAN(eps=low_score_anomaly_dbscan_eps, min_samples=low_score_anomaly_dbscan_min_samples)
+            res_labels = dbscan.fit_predict(Z[drift_indices])
+            
+            unique_clusters = set(res_labels) - {-1}
+            valid_new_indices = []
+            
+            for c in unique_clusters:
+                c_mask = (res_labels == c)
+                curr_indices = drift_indices[c_mask]
+                
+                # 【核心过滤优化】：计算该新行为簇的平均重构误差。
+                # 如果这个簇的重构误差过高，说明它是真正的突发集体威胁，绝不能固化为良性模式！
+                if np.mean(score_recon[curr_indices]) > baseline_f1_threshold:
+                    continue  # 视为异常流，不予注入良性原型库
+                
+                valid_new_indices.extend(curr_indices.tolist())
+                
+                # 固化良性演进原型
+                Z_c = Z_tensor[curr_indices]
+                centroid = torch.nn.functional.normalize(torch.mean(Z_c, dim=0, keepdim=True), p=2, dim=-1)
+                r_95 = max(torch.quantile(torch.cdist(Z_c, centroid, p=2).view(-1), 0.95).item(), 0.15)
+                
+                model.proto_layer.prototypes = nn.Parameter(torch.cat([model.proto_layer.prototypes.data, centroid], dim=0))
+                model.unified_radii = torch.cat([model.unified_radii, torch.tensor([r_95], device=device)], dim=0)
+
+            # 重新映射最终的原型边界惩罚项
+            protos_norm_final = torch.nn.functional.normalize(model.proto_layer.prototypes.data, p=2, dim=-1)
+            dists_final = torch.cdist(Z_tensor, protos_norm_final, p=2).cpu().numpy()
+            f_min_dist = np.min(dists_final, axis=1)
+            f_hit_id = np.argmin(dists_final, axis=1)
+            
+            final_radii = model.unified_radii.cpu().numpy()
+            margin = np.maximum(f_min_dist - (final_radii[f_hit_id] * tta_radius_tolerance), 0.0)
+            
+            # 引入惩罚项
+            final_anomaly_scores = score_recon + (proto_penalty_weight * margin)
+            
+            if len(valid_new_indices) > 0:
+                valid_new_indices = np.unique(valid_new_indices)
+                new_cluster_data = {
+                    "num": torch.cat(raw_num_list, dim=0)[valid_new_indices],
+                    "ctx_dynamic": torch.cat(raw_ctx_dyn_list, dim=0)[valid_new_indices],
+                    "ctx_static": torch.cat(raw_ctx_stat_list, dim=0)[valid_new_indices],
+                    "seq": torch.cat(raw_seq_list, dim=0)[valid_new_indices]
+                }
+
+    # 指标统计与返回
+    auc = roc_auc_score(labels, final_anomaly_scores) if len(set(labels)) > 1 else 0.5
+    pr_auc = average_precision_score(labels, final_anomaly_scores) if len(set(labels)) > 1 else 0.0
+    
+    return {
+        "scores": final_anomaly_scores, "labels": labels, "auc": auc, "pr_auc": pr_auc,
+        "new_cluster_data": new_cluster_data, "user_dates": user_dates
+    }
+
+
 def precision_at_k(y_true, scores, k: int = 100) -> float:
     y_true = np.asarray(y_true)
     scores = np.asarray(scores)

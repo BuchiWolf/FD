@@ -3,6 +3,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class UnifiedPrototypeLayer(nn.Module):
+    """ 在统一的联合潜在空间中维护行为原型，避免多维度割裂引起的噪声抖动 """
+    def __init__(self, k: int, latent_dim: int):
+        super().__init__()
+        self.prototypes = nn.Parameter(torch.randn(int(k), int(latent_dim)))
+
+    def forward(self, z: torch.Tensor):
+        # 统一规范化拓扑度量范围
+        normalized_prototypes = F.normalize(self.prototypes, p=2, dim=1)
+        distances = torch.cdist(z, normalized_prototypes, p=2)
+        min_dist, hit_idx = torch.min(distances, dim=1)
+        return min_dist, hit_idx, normalized_prototypes
+
+
 class PrototypeLayer(nn.Module):
     def __init__(self, k: int, latent_dim: int):
         super().__init__()
@@ -42,6 +56,79 @@ class MLPStaticFusion(nn.Module):
     def forward(self, z: torch.Tensor, ctx_static: torch.Tensor) -> torch.Tensor:
         fused_input = torch.cat([z, ctx_static], dim=-1)
         return self.mlp(fused_input)
+
+
+class OptimizedThreeZAutoencoder(nn.Module):
+    def __init__(self, num_dim: int, ctx_dim: int, vocab_size: int, max_seq_len: int,
+                 embed_dim: int = 64, z_dim: int = 48, num_prototypes: int = 40,
+                 ctx_dynamic_dim: int = None, ctx_static_dim: int = None):
+        super().__init__()
+        self.z_dim = int(z_dim)
+        self.vocab_size = int(vocab_size)
+        self.num_dim = int(num_dim)
+        self.ctx_dim = int(ctx_dim)
+        self.max_seq_len = int(max_seq_len)
+        self.ctx_dynamic_dim = int(ctx_dynamic_dim)
+        self.ctx_static_dim = int(ctx_static_dim)
+        
+        # 保持多模态基础编码器
+        self.num_enc = nn.Sequential(nn.Linear(num_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim))
+        self.ctx_dyn_enc = nn.Sequential(nn.Linear(ctx_dynamic_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim))
+        self.seq_emb = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.seq_pos_emb = nn.Embedding(max_seq_len, embed_dim)
+        
+        seq_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=4, batch_first=True)
+        self.seq_enc = nn.TransformerEncoder(seq_layer, num_layers=1)
+        
+        # 核心改变：全模态联合投影，将多视图特征深度耦合
+        self.joint_encoder = nn.Sequential(
+            nn.Linear(embed_dim * 3, embed_dim * 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim * 2, z_dim)
+        )
+        
+        # 统一原型层
+        self.proto_layer = UnifiedPrototypeLayer(k=num_prototypes, latent_dim=z_dim)
+        
+        # 解码网络结构
+        self.num_dec = nn.Sequential(nn.Linear(z_dim + ctx_static_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, num_dim))
+        self.ctx_dyn_dec = nn.Sequential(nn.Linear(z_dim + ctx_static_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, ctx_dynamic_dim))
+        self.seq_dec_lstm = nn.LSTM(input_size=embed_dim + z_dim, hidden_size=embed_dim, batch_first=True)
+        self.seq_out = nn.Linear(embed_dim, vocab_size)
+        
+        self.unified_radii = None
+
+    def forward(self, num: torch.Tensor, ctx_dynamic: torch.Tensor, ctx_static: torch.Tensor, seq: torch.Tensor):
+        # 编码多模态特征
+        e_num = self.num_enc(num)
+        e_dyn = self.ctx_dyn_enc(ctx_dynamic)
+        
+        pos_ids = torch.arange(seq.size(1), device=seq.device).unsqueeze(0).expand(seq.size(0), -1)
+        e_seq_in = self.seq_emb(seq) + self.seq_pos_emb(pos_ids)
+        e_seq = self.seq_enc(e_seq_in, src_key_padding_mask=seq.eq(0))
+        
+        mask = (~seq.eq(0)).unsqueeze(-1)
+        e_seq = (e_seq * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        
+        # 生成联合潜在表征空间 Z
+        concat_e = torch.cat([e_num, e_dyn, e_seq], dim=-1)
+        z = F.normalize(self.joint_encoder(concat_e), p=2, dim=1)
+        
+        # 原型度量
+        min_dist, hit_idx, norm_protos = self.proto_layer(z)
+        
+        # 融合静态上下文联合解码
+        z_fused = torch.cat([z, ctx_static], dim=-1)
+        r_num = self.num_dec(z_fused)
+        r_ctx_dyn = self.ctx_dyn_dec(z_fused)
+        
+        # 序列重构解码
+        shifted_seq = torch.cat([torch.full((seq.size(0), 1), 1, dtype=seq.dtype, device=seq.device), seq[:, :-1]], dim=1)
+        dec_input = torch.cat([self.seq_emb(shifted_seq), z.unsqueeze(1).repeat(1, seq.size(1), 1)], dim=-1)
+        lstm_out, _ = self.seq_dec_lstm(dec_input)
+        r_seq = self.seq_out(lstm_out)
+        
+        return z, r_num, r_ctx_dyn, r_seq, min_dist, hit_idx
 
 
 class StaticFusedThreeZAutoencoder(nn.Module):
