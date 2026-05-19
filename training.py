@@ -2,6 +2,7 @@ import csv
 import logging
 import os
 import pickle
+import numpy as np
 from datetime import datetime
 
 import torch
@@ -283,6 +284,34 @@ def _initialize_prototypes_with_kmeans(
     return init_stats
 
 
+def _prototype_losses(seperate_method: int, min_dist: torch.Tensor, prototypes: torch.Tensor):
+    loss_clustering = torch.mean(min_dist)
+    if int(prototypes.size(0)) <= 1:
+        return loss_clustering, torch.tensor(0.0, device=prototypes.device)
+    k = int(prototypes.size(0))
+    mask = torch.eye(k, device=prototypes.device).bool()
+    dist_matrix = torch.cdist(prototypes, prototypes, p=2)
+    off_diag = dist_matrix[~mask]
+    if int(seperate_method) == 1:
+        margin = 2.0
+        loss_separation = torch.mean(F.relu(margin - off_diag))
+    elif int(seperate_method) == 2:
+        tau = 1.0
+        loss_separation = torch.mean(torch.exp(-(off_diag**2) / tau))
+    elif int(seperate_method) == 3:
+        epsilon = 1e-4
+        loss_separation = torch.mean(1.0 / (off_diag + epsilon))
+    elif int(seperate_method) == 4:
+        masked_dist = dist_matrix.clone()
+        masked_dist.fill_diagonal_(float("inf"))
+        min_dists_between_protos, _ = torch.min(masked_dist, dim=1)
+        margin = 2.0
+        loss_separation = torch.mean(F.relu(margin - min_dists_between_protos))
+    else:
+        loss_separation = torch.mean(torch.exp(-off_diag))
+    return loss_clustering, loss_separation
+
+
 def train_model(
     train_pkl: str,
     num_epochs: int = 30,
@@ -297,33 +326,6 @@ def train_model(
     prune_ratio: float = 0.01,
     run_dir: str | None = None,
 ):
-    def _prototype_losses(seperate_method: int, min_dist: torch.Tensor, prototypes: torch.Tensor):
-        loss_clustering = torch.mean(min_dist)
-        if int(prototypes.size(0)) <= 1:
-            return loss_clustering, torch.tensor(0.0, device=prototypes.device)
-        k = int(prototypes.size(0))
-        mask = torch.eye(k, device=prototypes.device).bool()
-        dist_matrix = torch.cdist(prototypes, prototypes, p=2)
-        off_diag = dist_matrix[~mask]
-        if int(seperate_method) == 1:
-            margin = 2.0
-            loss_separation = torch.mean(F.relu(margin - off_diag))
-        elif int(seperate_method) == 2:
-            tau = 1.0
-            loss_separation = torch.mean(torch.exp(-(off_diag**2) / tau))
-        elif int(seperate_method) == 3:
-            epsilon = 1e-4
-            loss_separation = torch.mean(1.0 / (off_diag + epsilon))
-        elif int(seperate_method) == 4:
-            masked_dist = dist_matrix.clone()
-            masked_dist.fill_diagonal_(float("inf"))
-            min_dists_between_protos, _ = torch.min(masked_dist, dim=1)
-            margin = 2.0
-            loss_separation = torch.mean(F.relu(margin - min_dists_between_protos))
-        else:
-            loss_separation = torch.mean(torch.exp(-off_diag))
-        return loss_clustering, loss_separation
-
     logger.info("[%s] >>> 初始化数据集...", datetime.now())
     train_dataset = CERTDataset(train_pkl)
     train_loader = DataLoader(train_dataset, batch_size=int(batch_size), shuffle=True)
@@ -645,3 +647,175 @@ def train_model(
     if proto_summary is not None:
         meta["prototype_summary"] = proto_summary
     return model, meta
+
+class BufferDataset(Dataset):
+    def __init__(self, data_dict):
+        self.num = data_dict["num"]
+        self.ctx_dynamic = data_dict["ctx_dynamic"]
+        self.ctx_static = data_dict["ctx_static"]
+        self.seq = data_dict["seq"]
+
+    def __len__(self):
+        return len(self.num)
+
+    def __getitem__(self, idx):
+        return {
+            "num": self.num[idx],
+            "ctx_dynamic": self.ctx_dynamic[idx],
+            "ctx_static": self.ctx_static[idx],
+            "seq": self.seq[idx]
+        }
+
+def build_initial_memory_buffer(model, train_pkl, device, samples_per_proto=50):
+    """
+    Step 0: 在基线训练结束后，根据距离旧原型质心最近的 Top-N 提取基本盘核心集。
+    """
+    logger.info("[%s] >>> 开始构建初始 Memory Buffer (Top-%d / Prototype)...", datetime.now(), samples_per_proto)
+    dataset = CERTDataset(train_pkl)
+    loader = DataLoader(dataset, batch_size=256, shuffle=False)
+    model.eval()
+
+    z_dict = {"num": [], "dyn": [], "seq": []}
+    raw_num, raw_ctx_dyn, raw_ctx_stat, raw_seq = [], [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            num = batch["num"].to(device)
+            seq = batch["seq"].to(device)
+            ctx_dyn = batch.get("ctx_dynamic").to(device)
+            ctx_stat = batch.get("ctx_static").to(device)
+
+            z_cat, _, _, _, _, _ = model(num, ctx_dyn, ctx_stat, seq)
+            z_dim = model.z_dim
+            
+            z_dict["num"].append(F.normalize(z_cat[:, :z_dim], p=2, dim=-1).cpu())
+            z_dict["dyn"].append(F.normalize(z_cat[:, z_dim:2*z_dim], p=2, dim=-1).cpu())
+            z_dict["seq"].append(F.normalize(z_cat[:, 2*z_dim:], p=2, dim=-1).cpu())
+
+            raw_num.append(num.cpu())
+            raw_ctx_dyn.append(ctx_dyn.cpu())
+            raw_ctx_stat.append(ctx_stat.cpu())
+            raw_seq.append(seq.cpu())
+
+    Z = {d: torch.cat(z_dict[d], dim=0).to(device) for d in ["num", "dyn", "seq"]}
+    raw_data = {
+        "num": torch.cat(raw_num, dim=0),
+        "ctx_dynamic": torch.cat(raw_ctx_dyn, dim=0),
+        "ctx_static": torch.cat(raw_ctx_stat, dim=0),
+        "seq": torch.cat(raw_seq, dim=0)
+    }
+
+    buffer_indices = set()
+    for dim, layer_name in [("num", "proto_layer_num"), ("dyn", "proto_layer_dyn"), ("seq", "proto_layer_seq")]:
+        layer = getattr(model, layer_name)
+        protos = F.normalize(layer.prototypes, p=2, dim=-1)
+        dists = torch.cdist(Z[dim], protos, p=2)
+
+        for k in range(protos.size(0)):
+            k_dists = dists[:, k]
+            max_k = min(samples_per_proto, k_dists.size(0))
+            _, top_idx = torch.topk(k_dists, k=max_k, largest=False)
+            buffer_indices.update(top_idx.cpu().numpy().tolist())
+
+    idx_array = np.array(list(buffer_indices))
+    logger.info(">>> 初始 Memory Buffer 构建完毕，共保留 %d 个核心集样本", len(idx_array))
+    
+    return {k: v[idx_array] for k, v in raw_data.items()}
+
+def finetune_model_with_buffer(model, memory_buffer, new_cluster_data, device, vocab_size, weights, seperate_method=3, lr=1e-5, epochs=3, anchor_weight=100.0, samples_per_proto=50):
+    """
+    Step 4: 记忆回放微调。冻结/低学习率限制主干网络，对旧原型施加 Anchor Loss 防止位移，仅允许新原型自由适配。
+    """
+    logger.info("[%s] >>> 启动经验回放微调 (Epochs=%d, AnchorWeight=%.1f)...", datetime.now(), epochs, anchor_weight)
+    
+    # 1. 混合新老数据
+    merged_data = {}
+    for k in memory_buffer.keys():
+        if len(new_cluster_data[k]) > 0:
+            merged_data[k] = torch.cat([memory_buffer[k], new_cluster_data[k]], dim=0)
+        else:
+            merged_data[k] = memory_buffer[k]
+
+    dataset = BufferDataset(merged_data)
+    loader = DataLoader(dataset, batch_size=128, shuffle=True)
+
+    # 2. 极小学习率防遗忘
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion_mse = nn.MSELoss()
+    criterion_ce = nn.CrossEntropyLoss(ignore_index=0)
+
+    # 3. 抓取旧原型快照 (作为 Anchor)
+    old_protos = {}
+    for dim, layer_name in [("num", "proto_layer_num"), ("dyn", "proto_layer_dyn"), ("seq", "proto_layer_seq")]:
+        old_protos[dim] = getattr(model, layer_name).prototypes.detach().clone()
+
+    model.train()
+    for ep in range(epochs):
+        for batch in loader:
+            num = batch["num"].to(device)
+            ctx_dyn = batch["ctx_dynamic"].to(device)
+            ctx_stat = batch["ctx_static"].to(device)
+            seq = batch["seq"].to(device)
+            ctx = torch.cat([ctx_dyn, ctx_stat], dim=1)
+
+            optimizer.zero_grad()
+            z_cat, r_num, r_ctx, r_seq, proto_dists, _ = model(num, ctx_dyn, ctx_stat, seq)
+
+            loss_num = criterion_mse(r_num, num)
+            loss_ctx = criterion_mse(r_ctx, ctx) if torch.is_tensor(r_ctx) else torch.tensor(0.0, device=device)
+            loss_seq = criterion_ce(r_seq.view(-1, vocab_size), seq.view(-1))
+            loss_recon = weights["num"] * loss_num + weights["ctx"] * loss_ctx + weights["seq"] * loss_seq
+
+            loss_cluster_sum = torch.tensor(0.0, device=device)
+            loss_sep_sum = torch.tensor(0.0, device=device)
+            loss_anchor_sum = torch.tensor(0.0, device=device)
+
+            for dim, layer_name in [("num", "proto_layer_num"), ("dyn", "proto_layer_dyn"), ("seq", "proto_layer_seq")]:
+                layer = getattr(model, layer_name)
+                prototypes = layer.prototypes
+                
+                # 标准流形聚类与分离
+                lc, ls = _prototype_losses(seperate_method, proto_dists[dim], prototypes)
+                loss_cluster_sum = loss_cluster_sum + lc
+                loss_sep_sum = loss_sep_sum + ls
+
+                # Anchor Loss：严格惩罚“旧原型”偏离基线
+                k_old = old_protos[dim].size(0)
+                loss_anchor_sum = loss_anchor_sum + F.mse_loss(prototypes[:k_old], old_protos[dim])
+
+            loss = loss_recon + 10.0 * loss_cluster_sum + 0.01 * loss_sep_sum + anchor_weight * loss_anchor_sum
+            loss.backward()
+            optimizer.step()
+
+    # 4. 微调结束，更新 Memory Buffer（丢弃冗余，加入新的代表）
+    logger.info(">>> 微调结束，正在刷新 Memory Buffer 核心集...")
+    model.eval()
+    z_dict = {"num": [], "dyn": [], "seq": []}
+    loader_eval = DataLoader(dataset, batch_size=256, shuffle=False)
+    with torch.no_grad():
+        for batch in loader_eval:
+            num = batch["num"].to(device)
+            ctx_dyn = batch["ctx_dynamic"].to(device)
+            ctx_stat = batch["ctx_static"].to(device)
+            seq = batch["seq"].to(device)
+            z_cat = model(num, ctx_dyn, ctx_stat, seq)[0]
+            z_dim = model.z_dim
+            z_dict["num"].append(F.normalize(z_cat[:, :z_dim], p=2, dim=-1).cpu())
+            z_dict["dyn"].append(F.normalize(z_cat[:, z_dim:2*z_dim], p=2, dim=-1).cpu())
+            z_dict["seq"].append(F.normalize(z_cat[:, 2*z_dim:], p=2, dim=-1).cpu())
+
+    Z = {d: torch.cat(z_dict[d], dim=0).to(device) for d in ["num", "dyn", "seq"]}
+    new_buffer_indices = set()
+    for dim, layer_name in [("num", "proto_layer_num"), ("dyn", "proto_layer_dyn"), ("seq", "proto_layer_seq")]:
+        layer = getattr(model, layer_name)
+        protos = F.normalize(layer.prototypes, p=2, dim=-1)
+        dists = torch.cdist(Z[dim], protos, p=2)
+        for k in range(protos.size(0)):
+            _, top_idx = torch.topk(dists[:, k], k=min(samples_per_proto, dists.size(0)), largest=False)
+            new_buffer_indices.update(top_idx.cpu().numpy().tolist())
+
+    idx_array = np.array(list(new_buffer_indices))
+    updated_memory_buffer = {k: v[idx_array] for k, v in merged_data.items()}
+    logger.info(">>> 刷新完成，当前 Buffer 容量: %d", len(idx_array))
+    
+    return model, updated_memory_buffer

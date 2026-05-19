@@ -11,6 +11,7 @@ import torch
 
 from evaluation import evaluate_and_extract_z
 from training import find_latest_checkpoint, load_model_checkpoint, save_model_checkpoint, train_model
+from training import build_initial_memory_buffer, finetune_model_with_buffer
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +113,13 @@ def main():
     parser.add_argument("--low_score_anomaly_top_ratio", type=float, default=0.5)
     parser.add_argument("--low_score_anomaly_top_n", type=int, default=200)
     parser.add_argument("--low_score_anomaly_dbscan_eps", type=float, default=0.5)
-    parser.add_argument("--low_score_anomaly_dbscan_min_samples", type=int, default=10)
-    parser.add_argument("--num_prototypes", type=int, default=30) # 调大默认值，执行过表达
-    parser.add_argument("--prune_ratio", type=float, default=0.01) # 1% 剪枝阈值
+    parser.add_argument("--low_score_anomaly_dbscan_min_samples", type=int, default=200)
+    parser.add_argument("--num_prototypes", type=int, default=30)
+    parser.add_argument("--prune_ratio", type=float, default=0.01)
+    parser.add_argument("--disable_tta", action="store_true", help="关闭原型漂移适应机制 (TTA)")
+    parser.add_argument("--tta_ema_alpha", type=float, default=0.05, help="TTA 动量更新系数")
+    parser.add_argument("--tta_radius_tolerance", type=float, default=1.1, help="TTA 判定正常模式的半径容忍度")
+    parser.add_argument("--proto_penalty_weight", type=float, default=10.0, help="原型离群惩罚权重")
     args = parser.parse_args()
 
     run_dir = create_run_dir(args.output_dir, model_info="static_fused_three_z", comment=args.comment)
@@ -161,10 +166,16 @@ def main():
             else:
                 raise ValueError("未找到模型权重，无法进行评估")
 
-        logger.info(">>> 开始评估阶段...")
+        logger.info(">>> 开始评估与 TTA 持续适应阶段...")
         test_pkls = get_ordered_test_pkls(args.data_dir)
         if not test_pkls:
             raise ValueError(f"在 {args.data_dir} 中未找到测试集文件")
+
+        # [Step 0]: 构建初始化历史经验库 Buffer
+        train_pkl_path = os.path.join(args.data_dir, "train_set.pkl")
+        memory_buffer = build_initial_memory_buffer(
+            trained_model, train_pkl_path, device=device, samples_per_proto=50
+        )
 
         results_csv_path_base = os.path.join(args.output_dir, "evaluation_csv")
         eval_figure_dir = os.path.join(run_dir, "evaluation_figures")
@@ -172,6 +183,7 @@ def main():
         summary = []
 
         for test_pkl in test_pkls:
+            # [Step 1-3]: 推理与监控，发现新模式，执行 DBSCAN 与重打分
             result = evaluate_and_extract_z(
                 model=trained_model,
                 test_pkl=test_pkl,
@@ -185,8 +197,13 @@ def main():
                 low_score_anomaly_top_n=args.low_score_anomaly_top_n,
                 low_score_anomaly_dbscan_eps=args.low_score_anomaly_dbscan_eps,
                 low_score_anomaly_dbscan_min_samples=args.low_score_anomaly_dbscan_min_samples,
+                enable_tta=not args.disable_tta,
+                tta_ema_alpha=args.tta_ema_alpha,
+                tta_radius_tolerance=args.tta_radius_tolerance,
+                proto_penalty_weight=args.proto_penalty_weight,
             )
 
+            # ... (原有的 CSV 打点和评估落表逻辑保持不变)
             base = os.path.splitext(os.path.basename(test_pkl))[0]
             out_pkl = os.path.join(run_dir, f"{base}_z_features.pkl")
             with open(out_pkl, "wb") as f:
@@ -243,6 +260,25 @@ def main():
 
             auc_str = f"{result['auc']:.4f}" if result["auc"] is not None else "N/A"
             logger.info(">>> 测试完成: %s | samples=%d | anomalies=%d | auc=%s", base, n_samples, n_anomaly, auc_str)
+
+            # [Step 4]: 提取 DBSCAN 发掘的新簇代表样本并触发微调
+            new_cluster_data = result.get("new_cluster_data")
+            if new_cluster_data and len(new_cluster_data["num"]) > 0:
+                logger.info(">>> 发现新行为簇，正在使用 Memory Buffer 触发核心集经验回放微调...")
+                trained_model, memory_buffer = finetune_model_with_buffer(
+                    model=trained_model,
+                    memory_buffer=memory_buffer,
+                    new_cluster_data=new_cluster_data,
+                    device=device,
+                    vocab_size=meta["vocab_size"],
+                    weights=meta["weights"],
+                    seperate_method=args.seperate,
+                    lr=1e-5,          # 极小学习率冻结底层语义
+                    epochs=2,         # 极速 2 个 Epoch
+                    anchor_weight=100.0 # 施加超强锚点损失
+                )
+            else:
+                logger.info(">>> 本月数据无新模式固化，沿用当前 Memory Buffer 进入下一月度。")
 
         summary_path = os.path.join(run_dir, "evaluation_summary.pkl")
         with open(summary_path, "wb") as f:
