@@ -101,7 +101,9 @@ def metrics_at_best_f1(y_true, scores):
         "tpr": float(tp2 / (tp2 + fn2)) if (tp2 + fn2) > 0 else 0.0,
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        "f1": float(curve["f1"][best_i])
+        "f1": float(curve["f1"][best_i]),
+        "f2": float(fbeta_score(y_true, y_pred, beta=2, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred))
     }
 
 def fpr_at_target_recalls(y_true, scores, target_recalls=(0.8, 0.9, 0.95)):
@@ -146,7 +148,11 @@ def _save_score_distribution(y_true, scores, save_path: str) -> bool:
 def fallback_metrics_single_class(y_true, scores):
     y_pred = np.zeros_like(y_true, dtype=int) if np.sum(y_true == 1) == 0 else np.ones_like(y_true, dtype=int)
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    return {"threshold": float('inf'), "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn), "fpr": 0.0, "tpr": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": float(accuracy_score(y_true, y_pred))}
+    return {
+        "threshold": float('inf'), "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+        "fpr": 0.0, "tpr": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "f2": 0.0,
+        "accuracy": float(accuracy_score(y_true, y_pred))
+    }
 
 def _get_multihead_prototypes_concat(model) -> np.ndarray | None:
     if not all(hasattr(model, name) for name in ("proto_layer_num", "proto_layer_dyn", "proto_layer_seq")): return None
@@ -190,6 +196,8 @@ def evaluate_and_extract_z(
     tta_radius_tolerance: float = 0.85,
     proto_penalty_weight: float = 15.0,
     enable_tta: bool = True,
+    enable_pos_profiling: bool = True,
+    extract_new_clusters: bool = True,
 ):
     logger.info("[%s] >>> 启动双边界分流原型演进检测 Pipeline (TTA=%s): %s", datetime.now(), enable_tta, os.path.basename(test_pkl))
     test_dataset = CERTDataset(test_pkl)
@@ -249,8 +257,11 @@ def evaluate_and_extract_z(
     new_cluster_indices = []
     new_cluster_data = None
 
+    cls_metrics = metrics_at_best_f1(all_labels, score_raw) or fallback_metrics_single_class(all_labels, score_raw)
+
     if enable_tta:
         z_vectors_tensor = torch.tensor(z_vectors, device=device)
+        score_raw_tensor = torch.from_numpy(score_raw).to(device)
         z_dim = model.z_dim
         Z_dict = {
             "num": F.normalize(z_vectors_tensor[:, :z_dim], p=2, dim=-1),
@@ -261,97 +272,134 @@ def evaluate_and_extract_z(
         if not hasattr(model, 'proto_radii') or model.proto_radii is None:
             model.proto_radii = {d: torch.ones(getattr(model, f"proto_layer_{d}").prototypes.size(0), device=device) * 0.4 for d in ("num", "dyn", "seq")}
 
+        # 1. 预计算每个维度的距离、命中原型和判定结果
+        dim_info = {}
         for dim_key, layer_name in [("num", "proto_layer_num"), ("dyn", "proto_layer_dyn"), ("seq", "proto_layer_seq")]:
             layer = getattr(model, layer_name)
             prototypes = layer.prototypes.data
             radii = model.proto_radii[dim_key].to(device)
             Z = Z_dict[dim_key]
-
-            # [自适应空间上限计算]：基于当前存活老原型之间的最小间距动态约束漂移边界
-            if prototypes.size(0) > 1:
-                p_p_dists = torch.cdist(F.normalize(prototypes, p=2, dim=-1), F.normalize(prototypes, p=2, dim=-1), p=2)
-                eye_mask = torch.eye(prototypes.size(0), device=device).bool()
-                min_p_dist = p_p_dists[~eye_mask].min().item()
-                max_drift_dist = min(0.85, min_p_dist * 0.8) 
-                current_eps = min(low_score_anomaly_dbscan_eps, min_p_dist * 0.35)
-            else:
-                max_drift_dist = 0.85
-                current_eps = low_score_anomaly_dbscan_eps
-
+            
             dists = torch.cdist(Z, F.normalize(prototypes, p=2, dim=-1), p=2)
             min_dist, hit_id = torch.min(dists, dim=1)
-
             inner_thresholds = radii[hit_id] * tta_radius_tolerance
+            
             is_inlier = min_dist <= inner_thresholds
-            is_drift = (min_dist > inner_thresholds) & (min_dist <= max_drift_dist)
-            is_isolated = min_dist > max_drift_dist
-
-            status_labels = np.zeros(Z.shape[0], dtype=int)
-            status_labels[is_inlier.cpu().numpy()] = -2
-            status_labels[is_isolated.cpu().numpy()] = -1
-
-            new_protos_list = [prototypes]
-            new_radii_list = [radii]
-
+            # 记录该维度的漂移状态 (用于后续一票否决)
+            is_drift_dim = min_dist > inner_thresholds
+            
+            # EMA 更新现有原型 (保持原逻辑：只用顺应的样本更新)
             for k in range(prototypes.size(0)):
                 k_mask = (hit_id == k) & is_inlier
                 if k_mask.any():
                     prototypes[k].copy_((1 - tta_ema_alpha) * prototypes[k] + tta_ema_alpha * torch.mean(Z[k_mask], dim=0))
+            
+            dim_info[dim_key] = {
+                "min_dist": min_dist,
+                "hit_id": hit_id,
+                "is_inlier": is_inlier,
+                "is_drift": is_drift_dim,
+                "prototypes": prototypes,
+                "radii": radii,
+                "layer": layer
+            }
 
-            drift_indices = torch.nonzero(is_drift).view(-1)
-            n_new_clusters = 0
-            if drift_indices.numel() >= low_score_anomaly_dbscan_min_samples:
-                Z_drift_np = Z[drift_indices].cpu().numpy()
-                dbscan = DBSCAN(eps=current_eps, min_samples=low_score_anomaly_dbscan_min_samples, metric='euclidean')
-                res_labels = dbscan.fit_predict(Z_drift_np)
-                res_labels_adjusted = np.where(res_labels == -1, -1, res_labels)
-                status_labels[drift_indices.cpu().numpy()] = res_labels_adjusted
-
-                unique_c = set(res_labels_adjusted) - {-1}
-                for c in unique_c:
-                    c_mask = (res_labels_adjusted == c)
-                    Z_c = torch.tensor(Z_drift_np[c_mask], device=device)
+        # 2. 一票否决：只要有一个维度偏离，整体判定为 Drift
+        is_drift_global = dim_info["num"]["is_drift"] | dim_info["dyn"]["is_drift"] | dim_info["seq"]["is_drift"]
+        
+        # 3. 重构误差防火墙：排除高重构误差的潜在威胁样本 (极其重要)
+        baseline_thresh = float(cls_metrics["threshold"])
+        is_clean_drift = is_drift_global & (score_raw_tensor < baseline_thresh * 1.5)
+        
+        drift_indices = torch.nonzero(is_clean_drift).view(-1)
+        n_new_clusters = 0
+        res_labels = np.full(drift_indices.numel(), -1, dtype=int)
+        
+        # 4. 联合空间特征拼接与聚类 (Joint Clustering)
+        if drift_indices.numel() >= low_score_anomaly_dbscan_min_samples:
+            # 拼接三个维度的 Z 特征 [N_drift, z_dim * 3]
+            Z_concat_drift = torch.cat([
+                Z_dict["num"][drift_indices],
+                Z_dict["dyn"][drift_indices],
+                Z_dict["seq"][drift_indices]
+            ], dim=1).cpu().numpy()
+            
+            dbscan = DBSCAN(eps=low_score_anomaly_dbscan_eps, min_samples=low_score_anomaly_dbscan_min_samples, metric='euclidean')
+            res_labels = dbscan.fit_predict(Z_concat_drift)
+            
+            unique_c = set(res_labels) - {-1}
+            for c in unique_c:
+                c_mask = (res_labels == c)
+                curr_drift_idx = drift_indices[c_mask]
+                
+                # 记录新发现簇的样本索引，用于后续微调
+                new_cluster_indices.extend(curr_drift_idx.cpu().numpy().tolist())
+                
+                # 同步更新三个维度的原型层
+                for dim_key in ["num", "dyn", "seq"]:
+                    Z_c = Z_dict[dim_key][curr_drift_idx]
                     centroid = F.normalize(torch.mean(Z_c, dim=0, keepdim=True), p=2, dim=-1)
+                    # 计算该维度下的 95% 分位数作为新半径
                     r_95 = max(torch.quantile(torch.cdist(Z_c, centroid, p=2).view(-1), 0.95).item(), 0.1)
-
-                    new_protos_list.append(centroid)
-                    new_radii_list.append(torch.tensor([r_95], device=device, dtype=torch.float32))
                     
-                    # 记录新发现簇的样本索引，用于后续微调
-                    new_cluster_indices.extend(drift_indices[c_mask].cpu().numpy().tolist())
-                    n_new_clusters += 1
+                    layer = dim_info[dim_key]["layer"]
+                    layer.prototypes = nn.Parameter(torch.cat([layer.prototypes.data, centroid], dim=0))
+                    model.proto_radii[dim_key] = torch.cat([model.proto_radii[dim_key], torch.tensor([r_95], device=device)], dim=0)
+                
+                n_new_clusters += 1
 
-            if n_new_clusters > 0:
-                layer.prototypes = nn.Parameter(torch.cat(new_protos_list, dim=0))
-                model.proto_radii[dim_key] = torch.cat(new_radii_list, dim=0)
-
+        # 5. 重新计算最终距离和 Margin (使用更新后的原型)
+        for dim_key in ["num", "dyn", "seq"]:
+            layer = getattr(model, f"proto_layer_{dim_key}")
             final_protos = F.normalize(layer.prototypes.data, p=2, dim=-1)
             final_radii = model.proto_radii[dim_key].to(device)
+            Z = Z_dict[dim_key]
+            
             final_dists = torch.cdist(Z, final_protos, p=2)
             f_min_dist, f_hit_id = torch.min(final_dists, dim=1)
-
+            
             margin = torch.clamp(f_min_dist - (final_radii[f_hit_id] * tta_radius_tolerance), min=0.0)
+            
+            # 状态记录：-2: 顺应, -1: 离异, >=0: 新簇
+            status_labels = np.full(Z.shape[0], -1, dtype=int) # 默认为离异
+            is_inlier_final = f_min_dist <= (final_radii[f_hit_id] * tta_radius_tolerance)
+            status_labels[is_inlier_final.cpu().numpy()] = -2
+            
+            # 如果样本属于联合空间中的新簇，则标记对应的簇 ID
+            if n_new_clusters > 0:
+                drift_np_idx = drift_indices.cpu().numpy()
+                valid_drift_mask = (res_labels >= 0)
+                status_labels[drift_np_idx[valid_drift_mask]] = res_labels[valid_drift_mask]
+
             dist_dict[dim_key] = f_min_dist.cpu().numpy()
             margin_dict[dim_key] = margin.cpu().numpy()
             status_dict[dim_key] = status_labels
-            prototype_test_summary[dim_key] = {"old_k": prototypes.size(0), "new_k": final_protos.size(0), "n_drift": drift_indices.numel(), "new_clusters": n_new_clusters}
-            logger.info(f"   -> [{dim_key}] 空间分流: 顺应=%d | 偏离聚类=%d | 极限离异=%d | 演进新原型=%d", int(is_inlier.sum()), drift_indices.numel(), int(is_isolated.sum()), n_new_clusters)
+            prototype_test_summary[dim_key] = {
+                "old_k": dim_info[dim_key]["prototypes"].size(0),
+                "new_k": final_protos.size(0),
+                "n_drift": drift_indices.numel(),
+                "new_clusters": n_new_clusters
+            }
+            logger.info(f"   -> [{dim_key}] 空间分流 (联合判定): 顺应=%d | 偏离聚类池=%d | 演进新原型=%d", 
+                        int(is_inlier_final.sum()), drift_indices.numel(), n_new_clusters)
 
         total_margin = margin_dict["num"] + margin_dict["dyn"] + margin_dict["seq"]
         
     # 最终异常得分计算
     anomaly_scores = score_raw + (proto_penalty_weight * total_margin)
+    cls_metrics = metrics_at_best_f1(all_labels, anomaly_scores) or fallback_metrics_single_class(all_labels, anomaly_scores)
 
     # ---------------------------------------------------------
     # 终端日志：正样本细粒度行为安全画像监控
     # ---------------------------------------------------------
-    pos_mask = (all_labels == 1)
-    if pos_mask.any():
-        logger.info(f"   === 威胁(正样本)原型空间安全画像 ===")
-        logger.info(f"   -> 真实威胁样本总判定离异率 (超判定线比例): {np.mean(total_margin[pos_mask] > 0):.2%}")
-        for d in ["num", "dyn", "seq"]:
-            p_status = status_dict[d][pos_mask]
-            logger.info(f"   -> [{d}] 均距={np.mean(dist_dict[d][pos_mask]):.4f} | 伪装在旧模式内={np.mean(p_status == -2):.1%} | 突变被判定为确定游离异常={np.mean(p_status == -1):.1%} | 误入良性新模式簇={np.mean(p_status >= 0):.1%}")
+    if enable_pos_profiling:
+        pos_mask = (all_labels == 1)
+        if pos_mask.any():
+            logger.info(f"   === 威胁(正样本)原型空间安全画像 ===")
+            logger.info(f"   -> 真实威胁样本总判定离异率 (超判定线比例): {np.mean(total_margin[pos_mask] > 0):.2%}")
+            for d in ["num", "dyn", "seq"]:
+                p_status = status_dict[d][pos_mask]
+                logger.info(f"   -> [{d}] 均距={np.mean(dist_dict[d][pos_mask]):.4f} | 伪装在旧模式内={np.mean(p_status == -2):.1%} | 突变被判定为确定游离异常={np.mean(p_status == -1):.1%} | 误入良性新模式簇={np.mean(p_status >= 0):.1%}")
 
     # ---------------------------------------------------------
     # 各项关键指标评估与落表保存
@@ -378,9 +426,49 @@ def evaluate_and_extract_z(
         try: _save_latent_space_tsne(z_vectors, all_labels, model, os.path.join(figure_dir, f"{base}_tsne_latent.png"))
         except Exception as e: logger.error("t-SNE 失败: %s", e)
         
-        logger.info("-> 性能指标: ROC-AUC=%.4f, EER=%.4f, PR-AUC=%.4f, P@100=%.4f", auc, eer, pr_auc, p_at_100)
+        logger.info(
+            "-> 性能指标: ROC-AUC=%.4f, EER=%.4f, PR-AUC=%.4f, P@100=%.4f, P@K=%s",
+            auc,
+            eer,
+            pr_auc,
+            p_at_100,
+            {k: round(v, 4) for k, v in p_at_k.items()},
+        )
     
-    cls_metrics = metrics_at_best_f1(all_labels, anomaly_scores) or fallback_metrics_single_class(all_labels, anomaly_scores)
+    fpr = cls_metrics.get("fpr")
+    tpr = cls_metrics.get("tpr")
+    logger.info(
+        "-> 单点评估(best F1 threshold=%.6f): TP=%d FP=%d TN=%d FN=%d | FPR=%s TPR=%s | Precision=%.4f Recall=%.4f F1=%.4f F2=%.4f",
+        float(cls_metrics.get("threshold", 0.0)),
+        int(cls_metrics.get("tp", 0)),
+        int(cls_metrics.get("fp", 0)),
+        int(cls_metrics.get("tn", 0)),
+        int(cls_metrics.get("fn", 0)),
+        "N/A" if fpr is None else "{:.6f}".format(float(fpr)),
+        "N/A" if tpr is None else "{:.6f}".format(float(tpr)),
+        float(cls_metrics.get("precision", 0.0)),
+        float(cls_metrics.get("recall", 0.0)),
+        float(cls_metrics.get("f1", 0.0)),
+        float(cls_metrics.get("f2", 0.0)),
+    )
+
+    if fpr_at_recall:
+        for target in sorted(fpr_at_recall.keys()):
+            item = fpr_at_recall[target]
+            if item is None:
+                logger.info("-> FPR@Recall=%.2f: 不可达", float(target))
+            else:
+                logger.info(
+                    "-> FPR@Recall=%.2f: FPR=%.6f | thr=%.6f | Precision=%.4f | TP=%d FP=%d TN=%d FN=%d",
+                    float(target),
+                    float(item["fpr"]),
+                    float(item["threshold"]),
+                    float(item["precision"]),
+                    int(item["tp"]),
+                    int(item["fp"]),
+                    int(item["tn"]),
+                    int(item["fn"]),
+                )
 
     if dump_low_score_anomalies:
         base = os.path.splitext(os.path.basename(test_pkl))[0]
@@ -415,7 +503,7 @@ def evaluate_and_extract_z(
                 })
         logger.info(">>> 全量威胁与对比高分样本多维指标落库成功: %s", low_score_table_path)
 
-    if len(new_cluster_indices) > 0:
+    if extract_new_clusters and len(new_cluster_indices) > 0:
         new_cluster_indices = np.unique(new_cluster_indices)
         new_cluster_data = {
             "num": raw_num[new_cluster_indices],
@@ -427,8 +515,10 @@ def evaluate_and_extract_z(
         new_cluster_data = None
 
     return {
-        "z_vectors": z_vectors, "scores": anomaly_scores, "scores_raw": score_raw, "labels": all_labels,
-        "user_dates": all_user_dates, "indices": all_indices, "auc": auc, "eer": eer, "dr_at_budgets": dr_at_budgets,
+        "z_vectors": z_vectors, "scores": anomaly_scores, "scores_raw": score_raw, 
+        "err_num": err_num_all, "err_ctx": err_ctx_all, "err_seq": err_seq_all,
+        "labels": all_labels, "user_dates": all_user_dates, "indices": all_indices, 
+        "auc": auc, "eer": eer, "dr_at_budgets": dr_at_budgets,
         "pr_auc": pr_auc, "p_at_100": p_at_100, "p_at_k": p_at_k, "fpr_at_recall": fpr_at_recall, "metrics": cls_metrics,
         "prototype_test_summary": prototype_test_summary, "new_cluster_data": new_cluster_data,
     }

@@ -358,8 +358,8 @@ def train_model(
     criterion_ce = nn.CrossEntropyLoss(ignore_index=0)
 
     if weights is None:
-        weights = {"num": 1.0, "ctx": 10.0, "seq": 0.1}
-    weights = {"num": float(weights.get("num", 1.0)), "ctx": float(weights.get("ctx", 1.0)), "seq": float(weights.get("seq", 0.1))}
+        weights = {"num": 1.0, "ctx": 2.0, "seq": 0.05}
+    weights = {"num": float(weights.get("num", 1.0)), "ctx": float(weights.get("ctx", 2.0)), "seq": float(weights.get("seq", 0.05))}
 
     logger.info("[%s] >>> 开始训练...", datetime.now())
     model.train()
