@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 
 def evaluate_and_extract_z_optimized(
     model, test_pkl, batch_size=128, device="cuda", weights=None, vocab_size=8,
-    low_score_anomaly_dbscan_eps=0.12, low_score_anomaly_dbscan_min_samples=30,
-    tta_ema_alpha=0.02, tta_radius_tolerance=1.05, proto_penalty_weight=20.0,
-    enable_tta=True, baseline_f1_threshold=1.5
+    low_score_anomaly_dbscan_eps=0.15, low_score_anomaly_dbscan_min_samples=200,
+    tta_ema_alpha=0.02, tta_radius_tolerance=1.4, proto_penalty_weight=20.0,
+    enable_tta=True, baseline_f1_threshold=1.5,
+    output_dir=None
 ):
     # 基础初始化与数据加载逻辑
     from training import CERTDataset
@@ -79,32 +80,59 @@ def evaluate_and_extract_z_optimized(
     if not hasattr(model, 'unified_radii') or model.unified_radii is None:
         model.unified_radii = torch.ones(model.proto_layer.prototypes.size(0), device=device) * 0.35
 
+    # 优化 2：基于中位数与标准差的稳健动态防火墙
+    if not hasattr(model, 'ema_recon_median'):
+        model.ema_recon_median = np.median(score_recon)
+        model.ema_recon_std = np.std(score_recon)
+    
+    # 防火墙阈值：重构误差大于 (中位数 + 1.5 * 标准差) 的，直接剥夺演进资格
+    dynamic_firewall_thresh = model.ema_recon_median + 1.5 * model.ema_recon_std
+    logger.info(f"   [Dynamic Firewall] Median={model.ema_recon_median:.4f}, Std={model.ema_recon_std:.4f}, Thresh={dynamic_firewall_thresh:.4f}")
+
     final_anomaly_scores = score_recon.copy()
     new_cluster_data = None
     
     if enable_tta:
         Z_tensor = torch.tensor(Z, device=device)
+        # 获取最新的原型拓扑
         protos_norm = torch.nn.functional.normalize(model.proto_layer.prototypes.data, p=2, dim=-1)
-        dists_matrix = torch.cdist(Z_tensor, protos_norm, p=2)
+        Z_norm = torch.nn.functional.normalize(Z_tensor, p=2, dim=1)
+        
+        # 使用与训练一致的缩放余弦距离
+        cosine_sim = torch.matmul(Z_norm, protos_norm.T)
+        dists_matrix = (1.0 - cosine_sim) / 0.1 
         min_dists, hit_ids = torch.min(dists_matrix, dim=1)
         
-        # 边界协同判定：只有在未超过高风险重构防火墙时，才考虑将其视为潜在的概念漂移
         radii_thresh = model.unified_radii[hit_ids].cpu().numpy() * tta_radius_tolerance
-        is_drift_candidate = (min_dists.cpu().numpy() > radii_thresh) & (score_recon < baseline_f1_threshold * 1.3)
         
-        # 顺应模式下的现有原型动量更新
-        is_inlier = ~is_drift_candidate
+        # 【动态防火墙】：使用当前批次重构误差的 85% 分位数代替硬编码，防止高频攻击通过
+        dynamic_recon_thresh = np.percentile(score_recon, 85)
+        safe_recon_mask = score_recon < min(baseline_f1_threshold, dynamic_recon_thresh)
+        
+        is_drift_candidate = (min_dists.cpu().numpy() > radii_thresh) & safe_recon_mask
+        is_inlier = (min_dists.cpu().numpy() <= radii_thresh)
+        
+        # 【防中毒机制】：置信度加权的 EMA 顺应模式更新
         for k in range(protos_norm.size(0)):
-            mask = (hit_ids.cpu().numpy() == k) & is_inlier
-            if np.any(mask):
-                k_z = Z_tensor[torch.from_numpy(mask).to(device)]
-                model.proto_layer.prototypes.data[k] = (1 - tta_ema_alpha) * model.proto_layer.prototypes.data[k] + tta_ema_alpha * torch.mean(k_z, dim=0)
+            k_mask = (hit_ids.cpu().numpy() == k) & is_inlier
+            if np.any(k_mask):
+                k_z = Z_tensor[torch.from_numpy(k_mask).to(device)]
+                k_dists = min_dists[torch.from_numpy(k_mask).to(device)]
+                
+                # 置信度权重：距离越近，权重越接近 1；距离越靠近边界，权重越接近 0
+                confidence = torch.exp(-k_dists).unsqueeze(1)
+                effective_alpha = tta_ema_alpha * confidence
+                
+                # 动态微调该原型
+                updated_protos = (1 - effective_alpha) * protos_norm[k] + effective_alpha * k_z
+                model.proto_layer.prototypes.data[k] = torch.mean(updated_protos, dim=0)
 
-        # 执行联合表征空间 DBSCAN 模式发掘
+        # 概念漂移发现（DBSCAN）
         drift_indices = np.where(is_drift_candidate)[0]
         if len(drift_indices) >= low_score_anomaly_dbscan_min_samples:
-            dbscan = DBSCAN(eps=low_score_anomaly_dbscan_eps, min_samples=low_score_anomaly_dbscan_min_samples)
-            res_labels = dbscan.fit_predict(Z[drift_indices])
+            # 漂移聚类应该用原生的表征
+            dbscan = DBSCAN(eps=low_score_anomaly_dbscan_eps, min_samples=low_score_anomaly_dbscan_min_samples, metric="cosine")
+            res_labels = dbscan.fit_predict(Z_norm[drift_indices].cpu().numpy())
             
             unique_clusters = set(res_labels) - {-1}
             valid_new_indices = []
@@ -113,31 +141,32 @@ def evaluate_and_extract_z_optimized(
                 c_mask = (res_labels == c)
                 curr_indices = drift_indices[c_mask]
                 
-                # 【核心过滤优化】：计算该新行为簇的平均重构误差。
-                # 如果这个簇的重构误差过高，说明它是真正的突发集体威胁，绝不能固化为良性模式！
-                if np.mean(score_recon[curr_indices]) > baseline_f1_threshold:
-                    continue  # 视为异常流，不予注入良性原型库
+                # 双重校验：该新簇的平均重构误差必须低于安全线
+                if np.mean(score_recon[curr_indices]) > dynamic_recon_thresh:
+                    continue 
                 
                 valid_new_indices.extend(curr_indices.tolist())
-                
-                # 固化良性演进原型
                 Z_c = Z_tensor[curr_indices]
                 centroid = torch.nn.functional.normalize(torch.mean(Z_c, dim=0, keepdim=True), p=2, dim=-1)
-                r_95 = max(torch.quantile(torch.cdist(Z_c, centroid, p=2).view(-1), 0.95).item(), 0.15)
+                
+                # 设定新原型的有效管控半径
+                cluster_dists = (1.0 - torch.matmul(torch.nn.functional.normalize(Z_c, p=2, dim=-1), centroid.T)) / 0.1
+                r_95 = max(torch.quantile(cluster_dists.view(-1), 0.95).item(), 0.15)
                 
                 model.proto_layer.prototypes = nn.Parameter(torch.cat([model.proto_layer.prototypes.data, centroid], dim=0))
                 model.unified_radii = torch.cat([model.unified_radii, torch.tensor([r_95], device=device)], dim=0)
 
-            # 重新映射最终的原型边界惩罚项
+            # 更新完毕后，重新评估所有样本的最终距离与 Margin
             protos_norm_final = torch.nn.functional.normalize(model.proto_layer.prototypes.data, p=2, dim=-1)
-            dists_final = torch.cdist(Z_tensor, protos_norm_final, p=2).cpu().numpy()
+            cosine_sim_final = torch.matmul(Z_norm, protos_norm_final.T)
+            dists_final = ((1.0 - cosine_sim_final) / 0.1).cpu().numpy()
+            
             f_min_dist = np.min(dists_final, axis=1)
             f_hit_id = np.argmin(dists_final, axis=1)
             
             final_radii = model.unified_radii.cpu().numpy()
             margin = np.maximum(f_min_dist - (final_radii[f_hit_id] * tta_radius_tolerance), 0.0)
             
-            # 引入惩罚项
             final_anomaly_scores = score_recon + (proto_penalty_weight * margin)
             
             if len(valid_new_indices) > 0:
@@ -148,6 +177,21 @@ def evaluate_and_extract_z_optimized(
                     "ctx_static": torch.cat(raw_ctx_stat_list, dim=0)[valid_new_indices],
                     "seq": torch.cat(raw_seq_list, dim=0)[valid_new_indices]
                 }
+
+        # 监控原型半径膨胀率
+        radii_mean = model.unified_radii.mean().item()
+        radii_max = model.unified_radii.max().item()
+        logger.info(f"   [Radii Monitor] Mean={radii_mean:.4f}, Max={radii_max:.4f}")
+
+    # 落表：重构误差与原型距离的散点分布
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        scatter_path = os.path.join(output_dir, f"{os.path.basename(test_pkl)}_scatter_recon_dist.csv")
+        with open(scatter_path, "w", encoding="utf-8") as f:
+            f.write("score_recon,min_dist,label\n")
+            for sr, md, lb in zip(score_recon, min_dists_np, labels):
+                f.write(f"{sr:.6f},{md:.6f},{lb}\n")
+        logger.info(f"   [Scatter Plot Data] Saved to {scatter_path}")
 
     # 指标统计与返回
     auc = roc_auc_score(labels, final_anomaly_scores) if len(set(labels)) > 1 else 0.5
@@ -320,10 +364,10 @@ def evaluate_and_extract_z(
     target_recalls=(0.8, 0.9, 0.95), budget_list=(0.05, 0.10, 0.15),
     figure_dir: str | None = None, dump_low_score_anomalies: bool = True,
     low_score_anomaly_top_ratio: float = 0.5, low_score_anomaly_top_n: int = 200,
-    low_score_anomaly_dbscan_eps: float = 0.15,
-    low_score_anomaly_dbscan_min_samples: int = 200,
-    tta_ema_alpha: float = 0.05,
-    tta_radius_tolerance: float = 0.85,
+    low_score_anomaly_dbscan_eps: float = 0.005,
+    low_score_anomaly_dbscan_min_samples: int = 1000,
+    tta_ema_alpha: float = 0.02,
+    tta_radius_tolerance: float = 0.7,
     proto_penalty_weight: float = 15.0,
     enable_tta: bool = True,
     enable_pos_profiling: bool = True,
@@ -333,8 +377,8 @@ def evaluate_and_extract_z(
     test_dataset = CERTDataset(test_pkl)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=int(batch_size), shuffle=False)
     
-    if weights is None: weights = {"num": 1.0, "ctx": 1.0, "seq": 0.1}
-    w_num, w_ctx, w_seq = float(weights.get("num", 1.0)), float(weights.get("ctx", 1.0)), float(weights.get("seq", 0.1))
+    if weights is None: weights = {"num": 1.0, "ctx": 2.0, "seq": 0.1}
+    w_num, w_ctx, w_seq = float(weights.get("num", 1.0)), float(weights.get("ctx", 2.0)), float(weights.get("seq", 0.1))
     model.eval()
 
     z_vectors, err_num_all, err_ctx_all, err_seq_all = [], [], [] ,[]

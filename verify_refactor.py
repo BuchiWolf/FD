@@ -44,8 +44,16 @@ def test_workflow():
     weights = {"num": 1.0, "ctx": 1.0, "seq": 0.1}
     results = evaluate_and_extract_z_optimized(
         model, test_pkl, batch_size=batch_size, device=device, weights=weights,
-        vocab_size=vocab_size, enable_tta=True, low_score_anomaly_dbscan_min_samples=5
+        vocab_size=vocab_size, enable_tta=True, low_score_anomaly_dbscan_min_samples=5,
+        output_dir="./test_output"
     )
+    
+    # 检查落表文件
+    scatter_file = f"./test_output/{os.path.basename(test_pkl)}_scatter_recon_dist.csv"
+    if os.path.exists(scatter_file):
+        print(f">>> 散点分布落表验证成功: {scatter_file}")
+    else:
+        print(">>> 错误：散点分布落表文件未生成！")
     
     print(f">>> 评估验证完成: AUC={results['auc']:.4f}, PR-AUC={results['pr_auc']:.4f}")
     

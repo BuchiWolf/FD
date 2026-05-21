@@ -285,30 +285,36 @@ def _initialize_prototypes_with_kmeans(
 
 
 def _prototype_losses(seperate_method: int, min_dist: torch.Tensor, prototypes: torch.Tensor):
+    # 1. 聚类损失：拉近样本与最近原型的距离
     loss_clustering = torch.mean(min_dist)
+    
     if int(prototypes.size(0)) <= 1:
         return loss_clustering, torch.tensor(0.0, device=prototypes.device)
+        
+    # 2. 分离损失 (Separation Loss) 重构
+    norm_p = F.normalize(prototypes, p=2, dim=1)
+    # 计算原型间的余弦相似度矩阵
+    sim_matrix = torch.matmul(norm_p, norm_p.T)
+    
     k = int(prototypes.size(0))
     mask = torch.eye(k, device=prototypes.device).bool()
-    dist_matrix = torch.cdist(prototypes, prototypes, p=2)
-    off_diag = dist_matrix[~mask]
+    sim_matrix.masked_fill_(mask, -1.0) # 排除对角线自身
+    
+    # 获取每个原型最相似（最近）的其他原型
+    max_sim_between_protos, _ = torch.max(sim_matrix, dim=1)
+    
     if int(seperate_method) == 1:
-        margin = 2.0
-        loss_separation = torch.mean(F.relu(margin - off_diag))
+        # Cosine Margin: 如果原型间相似度大于 0.5 (夹角小于 60度)，则进行惩罚
+        margin_sim = 0.5 
+        loss_separation = torch.mean(F.relu(max_sim_between_protos - margin_sim))
     elif int(seperate_method) == 2:
-        tau = 1.0
-        loss_separation = torch.mean(torch.exp(-(off_diag**2) / tau))
-    elif int(seperate_method) == 3:
-        epsilon = 1e-4
-        loss_separation = torch.mean(1.0 / (off_diag + epsilon))
-    elif int(seperate_method) == 4:
-        masked_dist = dist_matrix.clone()
-        masked_dist.fill_diagonal_(float("inf"))
-        min_dists_between_protos, _ = torch.min(masked_dist, dim=1)
-        margin = 2.0
-        loss_separation = torch.mean(F.relu(margin - min_dists_between_protos))
+        # 基于 Softmax 的 InfoNCE 正交损失 (推荐)
+        temp = 0.1
+        loss_separation = torch.mean(torch.logsumexp(sim_matrix / temp, dim=1))
     else:
-        loss_separation = torch.mean(torch.exp(-off_diag))
+        # 默认：温和的指数惩罚
+        loss_separation = torch.mean(torch.exp(max_sim_between_protos))
+        
     return loss_clustering, loss_separation
 
 

@@ -4,28 +4,41 @@ import torch.nn.functional as F
 
 
 class UnifiedPrototypeLayer(nn.Module):
-    """ 在统一的联合潜在空间中维护行为原型，避免多维度割裂引起的噪声抖动 """
-    def __init__(self, k: int, latent_dim: int):
+    """ 优化后的联合原型层：引入缩放余弦距离和温度系数 """
+    def __init__(self, k: int, latent_dim: int, temp: float = 0.1):
         super().__init__()
         self.prototypes = nn.Parameter(torch.randn(int(k), int(latent_dim)))
+        self.temp = temp
 
     def forward(self, z: torch.Tensor):
-        # 统一规范化拓扑度量范围
         normalized_prototypes = F.normalize(self.prototypes, p=2, dim=1)
-        distances = torch.cdist(z, normalized_prototypes, p=2)
+        z_norm = F.normalize(z, p=2, dim=1)
+        
+        # 使用缩放余弦距离替代纯 L2 (更适合高维超球面表示)
+        # 余弦相似度 [-1, 1] -> 距离 [0, 2]
+        cosine_sim = torch.matmul(z_norm, normalized_prototypes.T)
+        distances = (1.0 - cosine_sim) / self.temp
+        
         min_dist, hit_idx = torch.min(distances, dim=1)
         return min_dist, hit_idx, normalized_prototypes
 
 
 class PrototypeLayer(nn.Module):
-    def __init__(self, k: int, latent_dim: int):
+    """ 优化后的单维度原型层 """
+    def __init__(self, k: int, latent_dim: int, temp: float = 0.1):
         super().__init__()
         self.prototypes = nn.Parameter(torch.randn(int(k), int(latent_dim)))
+        self.temp = temp
 
     def forward(self, z: torch.Tensor):
         normalized_prototypes = F.normalize(self.prototypes, p=2, dim=1)
-        distances = torch.cdist(z, normalized_prototypes, p=2)
-        min_dist, _ = torch.min(distances, dim=1)
+        z_norm = F.normalize(z, p=2, dim=1)
+        
+        cosine_sim = torch.matmul(z_norm, normalized_prototypes.T)
+        distances = (1.0 - cosine_sim) / self.temp
+        
+        min_dist, hit_idx = torch.min(distances, dim=1)
+        # 兼容旧 API 接口返回
         return min_dist, normalized_prototypes
 
 
@@ -99,12 +112,24 @@ class OptimizedThreeZAutoencoder(nn.Module):
         self.unified_radii = None
 
     def forward(self, num: torch.Tensor, ctx_dynamic: torch.Tensor, ctx_static: torch.Tensor, seq: torch.Tensor):
+        if self.training:
+            # 优化 3：掩码自编码机制 (MAE)，破坏恒等映射
+            # 为连续变量添加高斯噪声 (Data Augmentation)
+            num_noisy = num + torch.randn_like(num) * 0.05
+            # 为离散序列应用 10% 的 Token Masking (将 Token 替换为 0，即 padding_idx)
+            mask = torch.rand_like(seq, dtype=torch.float) < 0.1
+            seq_noisy = seq.clone()
+            seq_noisy[mask] = 0
+        else:
+            num_noisy = num
+            seq_noisy = seq
+
         # 编码多模态特征
-        e_num = self.num_enc(num)
+        e_num = self.num_enc(num_noisy)
         e_dyn = self.ctx_dyn_enc(ctx_dynamic)
         
         pos_ids = torch.arange(seq.size(1), device=seq.device).unsqueeze(0).expand(seq.size(0), -1)
-        e_seq_in = self.seq_emb(seq) + self.seq_pos_emb(pos_ids)
+        e_seq_in = self.seq_emb(seq_noisy) + self.seq_pos_emb(pos_ids)
         e_seq = self.seq_enc(e_seq_in, src_key_padding_mask=seq.eq(0))
         
         mask = (~seq.eq(0)).unsqueeze(-1)

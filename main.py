@@ -112,14 +112,14 @@ def main():
     parser.add_argument("--disable_low_score_anomaly_dump", action="store_true")
     parser.add_argument("--low_score_anomaly_top_ratio", type=float, default=0.5)
     parser.add_argument("--low_score_anomaly_top_n", type=int, default=200)
-    parser.add_argument("--low_score_anomaly_dbscan_eps", type=float, default=0.5)
-    parser.add_argument("--low_score_anomaly_dbscan_min_samples", type=int, default=200)
+    parser.add_argument("--low_score_anomaly_dbscan_eps", type=float, default=0.03)
+    parser.add_argument("--low_score_anomaly_dbscan_min_samples", type=int, default=500)
     parser.add_argument("--num_prototypes", type=int, default=30)
     parser.add_argument("--prune_ratio", type=float, default=0.01)
     parser.add_argument("--disable_tta", action="store_true", help="关闭原型漂移适应机制 (TTA)")
     parser.add_argument("--tta_ema_alpha", type=float, default=0.05, help="TTA 动量更新系数")
-    parser.add_argument("--tta_radius_tolerance", type=float, default=1.1, help="TTA 判定正常模式的半径容忍度")
-    parser.add_argument("--proto_penalty_weight", type=float, default=10.0, help="原型离群惩罚权重")
+    parser.add_argument("--tta_radius_tolerance", type=float, default=0.3, help="TTA 判定正常模式的半径容忍度")
+    parser.add_argument("--proto_penalty_weight", type=float, default=1.0, help="原型离群惩罚权重")
     args = parser.parse_args()
 
     run_dir = create_run_dir(args.output_dir, model_info="static_fused_three_z", comment=args.comment)
@@ -288,3 +288,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
